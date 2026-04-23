@@ -147,18 +147,12 @@ async function fetchProfiles(filters, options) {
     // Standard inclusive ages
     if (filters.min_age !== undefined) { baseQuery += " AND age >= ?"; params.push(Number(filters.min_age)); }
     if (filters.max_age !== undefined) { baseQuery += " AND age <= ?"; params.push(Number(filters.max_age)); }
-    
-    // Strict greater/less than for words like "above" and "below"
-    if (filters.min_age_strict !== undefined) { baseQuery += " AND age > ?"; params.push(Number(filters.min_age_strict)); }
-    if (filters.max_age_strict !== undefined) { baseQuery += " AND age < ?"; params.push(Number(filters.max_age_strict)); }
-    
     if (filters.min_gender_probability !== undefined) { baseQuery += " AND gender_probability >= ?"; params.push(Number(filters.min_gender_probability)); }
     if (filters.min_country_probability !== undefined) { baseQuery += " AND country_probability >= ?"; params.push(Number(filters.min_country_probability)); }
 
     const countResult = await dbGet(`SELECT COUNT(*) as total ${baseQuery}`, params);
     const total = countResult.total;
 
-    // Handle both sort_by and sortBy safely
     const validSortColumns = ['age', 'created_at', 'gender_probability'];
     let sortByParam = options.sort_by || options.sortBy;
     let sortColumn = validSortColumns.includes(sortByParam) ? sortByParam : 'created_at';
@@ -170,78 +164,54 @@ async function fetchProfiles(filters, options) {
     let limit = Math.max(1, Math.min(50, parseInt(options.limit) || 10));
     let offset = (page - 1) * limit;
 
-    // CRITICAL FIX: Added ', id ASC' as a tie-breaker to guarantee stable pagination!
     const dataQuery = `SELECT * ${baseQuery} ORDER BY ${sortColumn} ${sortOrder}, id ASC LIMIT ? OFFSET ?`;
     const data = await dbAll(dataQuery, [...params, limit, offset]);
 
-    return { 
-        total, 
-        page, 
-        limit, 
-        total_pages: Math.ceil(total / limit),
-        data 
-    };
+    // Stripped down to strictly required envelope fields
+    return { total, page, limit, data };
 }
 
 function parseNLQuery(queryText) {
     if (!queryText || queryText.trim() === '') return null;
     let q = queryText.toLowerCase().replace(/[^a-z0-9\s]/g, '');
     let filters = {};
-    let matched = false;
 
     let isMale = /\b(male|males|men|boy|boys)\b/.test(q);
     let isFemale = /\b(female|females|women|girl|girls)\b/.test(q);
-    
-    // If the query mentions BOTH (e.g. "Male and female"), we intentionally set NO gender filter to return all.
-    if (isMale && !isFemale) { filters.gender = 'male'; matched = true; }
-    if (isFemale && !isMale) { filters.gender = 'female'; matched = true; }
+    if (isMale && !isFemale) filters.gender = 'male';
+    if (isFemale && !isMale) filters.gender = 'female';
 
-    if (/\b(child|children)\b/.test(q)) { filters.age_group = 'child'; matched = true; }
-    if (/\b(teenager|teenagers|teens)\b/.test(q)) { filters.age_group = 'teenager'; matched = true; }
-    if (/\b(adult|adults)\b/.test(q)) { filters.age_group = 'adult'; matched = true; }
-    if (/\b(senior|seniors)\b/.test(q)) { filters.age_group = 'senior'; matched = true; }
+    if (/\b(child|children)\b/.test(q)) filters.age_group = 'child';
+    if (/\b(teenager|teenagers|teens)\b/.test(q)) filters.age_group = 'teenager';
+    if (/\b(adult|adults)\b/.test(q)) filters.age_group = 'adult';
+    if (/\b(senior|seniors)\b/.test(q)) filters.age_group = 'senior';
 
-    // Interpret "young" broadly as under 30
-    if (/\byoung\b/.test(q)) { filters.max_age_strict = 30; matched = true; }
-
-    // Strict Greater Than ("above 30" -> age > 30)
+    // Strict mathematical bounds
     let aboveMatch = q.match(/(?:above|over|older than|greater than)\s+(\d+)/);
-    if (aboveMatch) { filters.min_age_strict = parseInt(aboveMatch[1], 10); matched = true; }
+    if (aboveMatch) filters.min_age = parseInt(aboveMatch[1], 10) + 1; // "above 30" -> age >= 31
     
-    // Strict Less Than
     let belowMatch = q.match(/(?:below|under|younger than|less than)\s+(\d+)/);
-    if (belowMatch) { filters.max_age_strict = parseInt(belowMatch[1], 10); matched = true; }
+    if (belowMatch) filters.max_age = parseInt(belowMatch[1], 10) - 1; // "below 30" -> age <= 29
 
-    // Expanded Country Map for edge cases
+    // "Young" fallback
+    if (/\byoung\b/.test(q) && !belowMatch) filters.max_age = 30;
+
+    // Simplified Country Matching
     const countryMap = {
         "nigeria": "NG", "united states": "US", "america": "US", "usa": "US",
         "cameroon": "CM", "ghana": "GH", "kenya": "KE",
-        "south africa": "ZA", "united kingdom": "GB", "england": "GB", "uk": "GB",
-        "canada": "CA", "australia": "AU", "india": "IN", "germany": "DE",
-        "france": "FR", "italy": "IT", "spain": "ES", "brazil": "BR"
+        "south africa": "ZA", "united kingdom": "GB", "england": "GB", "uk": "GB"
     };
 
-    // Check for explicit 2-letter codes first (e.g., "from NG")
-    let exactCodeMatch = q.match(/from\s+([a-z]{2})\b/);
-    if (exactCodeMatch) {
-        filters.country_id = exactCodeMatch[1].toUpperCase();
-        matched = true;
-    } else {
-        let fromMatch = q.match(/from\s+([a-z\s]+)/);
-        if (fromMatch) {
-            let potentialCountry = fromMatch[1].trim();
-            for (let countryName in countryMap) {
-                if (potentialCountry.includes(countryName)) {
-                    filters.country_id = countryMap[countryName];
-                    matched = true;
-                    break;
-                }
-            }
+    for (let countryName in countryMap) {
+        if (q.includes(countryName)) {
+            filters.country_id = countryMap[countryName];
+            break;
         }
     }
 
-    if (!matched && /\bpeople\b/.test(q)) matched = true;
-    return matched ? filters : null;
+    // If we matched any filters, OR if they just said "people/persons" (which returns all), return it.
+    return Object.keys(filters).length > 0 || /\b(people|persons)\b/.test(q) ? filters : null;
 }
 
 // GET Natural Language Search
@@ -254,14 +224,13 @@ app.get('/api/profiles/search', async (req, res) => {
         if (!filters) return res.status(400).json({ status: "error", message: "Unable to interpret query" });
 
         const result = await fetchProfiles(filters, { page, limit });
+        
+        // Strict JSON Envelope Output
         return res.status(200).json({ 
             status: "success", 
-            parsed_filters: filters, // Sometimes bots check this explicitly to see if your parser worked!
-            count: result.data.length,
-            page: result.page, 
-            limit: result.limit, 
-            total: result.total, 
-            total_pages: result.total_pages,
+            page: Number(result.page), 
+            limit: Number(result.limit), 
+            total: Number(result.total), 
             data: result.data 
         });
     } catch (error) {
@@ -272,20 +241,18 @@ app.get('/api/profiles/search', async (req, res) => {
 // GET Advanced Filtering endpoint 
 app.get('/api/profiles', async (req, res) => {
     try {
-        // Extract sorting params, allowing camelCase or snake_case
         const { sort_by, sortBy, order, sortOrder, page, limit, ...filters } = req.query;
         if (filters.min_age && isNaN(filters.min_age)) return res.status(422).json({ status: "error", message: "Invalid parameter type" });
 
         const options = { sort_by: sort_by || sortBy, order: order || sortOrder, page, limit };
         const result = await fetchProfiles(filters, options);
         
+        // Strict JSON Envelope Output
         return res.status(200).json({ 
             status: "success", 
-            count: result.data.length,
-            page: result.page, 
-            limit: result.limit, 
-            total: result.total, 
-            total_pages: result.total_pages,
+            page: Number(result.page), 
+            limit: Number(result.limit), 
+            total: Number(result.total), 
             data: result.data 
         });
     } catch (error) {
