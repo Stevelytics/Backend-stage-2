@@ -144,6 +144,7 @@ async function fetchProfiles(filters, options) {
     if (filters.age_group) { baseQuery += " AND LOWER(age_group) = ?"; params.push(filters.age_group.toLowerCase()); }
     if (filters.country_id) { baseQuery += " AND UPPER(country_id) = ?"; params.push(filters.country_id.toUpperCase()); }
     
+    // Inclusive ages
     if (filters.min_age !== undefined) { baseQuery += " AND age >= ?"; params.push(Number(filters.min_age)); }
     if (filters.max_age !== undefined) { baseQuery += " AND age <= ?"; params.push(Number(filters.max_age)); }
     if (filters.min_gender_probability !== undefined) { baseQuery += " AND gender_probability >= ?"; params.push(Number(filters.min_gender_probability)); }
@@ -171,37 +172,35 @@ async function fetchProfiles(filters, options) {
 
 function parseNLQuery(queryText) {
     if (!queryText || queryText.trim() === '') return null;
-    let q = queryText.toLowerCase();
+    let q = queryText.toLowerCase().replace(/[^a-z0-9\s]/g, '');
     let filters = {};
 
-    // 1. Gender Logic
     let isMale = /\b(male|males|men|boy|boys)\b/.test(q);
     let isFemale = /\b(female|females|women|girl|girls)\b/.test(q);
     if (isMale && !isFemale) filters.gender = 'male';
     if (isFemale && !isMale) filters.gender = 'female';
-    // Note: If both are true ("Male and female"), we intentionally leave filters.gender empty.
+    // If BOTH are true ("Male and female"), we leave gender blank to return all.
 
-    // 2. Age Group Logic
     if (/\b(child|children)\b/.test(q)) filters.age_group = 'child';
     if (/\b(teenager|teenagers|teens)\b/.test(q)) filters.age_group = 'teenager';
     if (/\b(adult|adults)\b/.test(q)) filters.age_group = 'adult';
     if (/\b(senior|seniors)\b/.test(q)) filters.age_group = 'senior';
 
-    // 3. Mathematical Age Bounds
-    if (/\byoung\b/.test(q)) filters.max_age = 30;
-
     let aboveMatch = q.match(/(?:above|over|older than|greater than)\s+(\d+)/);
-    if (aboveMatch) filters.min_age = parseInt(aboveMatch[1], 10) + 1; // "above 30" -> age >= 31
+    if (aboveMatch) filters.min_age = parseInt(aboveMatch[1], 10) + 1; // "above 17" -> age >= 18
     
     let belowMatch = q.match(/(?:below|under|younger than|less than)\s+(\d+)/);
-    if (belowMatch) filters.max_age = parseInt(belowMatch[1], 10) - 1; // "below 30" -> age <= 29
+    if (belowMatch) filters.max_age = parseInt(belowMatch[1], 10) - 1; 
 
-    // 4. Country Logic
+    // Strictly define "young" as youth (25 and under)
+    if (/\byoung\b/.test(q) && !belowMatch) filters.max_age = 25;
+
     const countryMap = {
         "nigeria": "NG", "kenya": "KE", "cameroon": "CM", "ghana": "GH",
         "south africa": "ZA", "united states": "US", "america": "US", "usa": "US",
         "united kingdom": "GB", "england": "GB", "uk": "GB"
     };
+
     for (let countryName in countryMap) {
         if (q.includes(countryName)) {
             filters.country_id = countryMap[countryName];
@@ -209,9 +208,7 @@ function parseNLQuery(queryText) {
         }
     }
 
-    // 5. Fallback
     if (Object.keys(filters).length === 0 && !/\b(people|persons)\b/.test(q)) return null;
-    
     return filters;
 }
 
@@ -226,13 +223,12 @@ app.get('/api/profiles/search', async (req, res) => {
 
         const result = await fetchProfiles(filters, { page, limit });
         
+        // Strictest possible pagination envelope
         return res.status(200).json({ 
             status: "success", 
-            count: result.data.length,
             page: Number(result.page), 
             limit: Number(result.limit), 
-            total: Number(result.total),
-            total_pages: Math.ceil(result.total / result.limit),
+            total: Number(result.total), 
             data: result.data 
         });
     } catch (error) {
@@ -249,13 +245,12 @@ app.get('/api/profiles', async (req, res) => {
         const options = { sort_by: sort_by || sortBy, order: order || sortOrder, page, limit };
         const result = await fetchProfiles(filters, options);
         
+        // Strictest possible pagination envelope
         return res.status(200).json({ 
             status: "success", 
-            count: result.data.length,
             page: Number(result.page), 
             limit: Number(result.limit), 
-            total: Number(result.total),
-            total_pages: Math.ceil(result.total / result.limit),
+            total: Number(result.total), 
             data: result.data 
         });
     } catch (error) {
@@ -263,12 +258,10 @@ app.get('/api/profiles', async (req, res) => {
     }
 });
 
-// Add a root URL health check route
 app.get('/', (req, res) => {
     res.status(200).json({ status: "success", message: "Welcome to the Profile Intelligence API!" });
 });
 
-// --- BULLETPROOF INITIALIZATION ---
 async function initializeDatabaseAndServer() {
     try {
         await dbRun(`DROP TABLE IF EXISTS profiles`);
@@ -285,7 +278,6 @@ async function initializeDatabaseAndServer() {
             created_at TEXT
         )`);
         console.log("Database wiped and rebuilt flawlessly.");
-
         app.listen(PORT, () => console.log(`Combined Stage Server running on port ${PORT}`));
     } catch (error) {
         console.error("Startup Error:", error);
